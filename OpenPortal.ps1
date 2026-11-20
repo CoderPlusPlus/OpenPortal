@@ -629,6 +629,31 @@ function Assert-BuildOutputs {
     }
 }
 
+# The log folder for the phase that is running. Every phase gets a fresh one, and
+# any failure -- even one that happens before the provisioner starts -- is written
+# into it, so a failed run always leaves something to read.
+$script:LogDir = $null
+
+function New-LogDir {
+    $dir = Join-Path $LogRoot (Get-Date -Format "yyyyMMdd-HHmmss")
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $script:LogDir = $dir
+    Write-Host "Logs:          $dir"
+    return $dir
+}
+
+# Append an error to the current log folder (it is already on the console). Falls
+# back to a fresh folder if the failure happened before a phase made one.
+function Write-RunError {
+    param([string]$Message)
+    try {
+        if (-not $script:LogDir) { $null = New-LogDir }
+        $line = "{0}  ERROR  {1}" -f (Get-Date -Format o), $Message
+        Add-Content -LiteralPath (Join-Path $script:LogDir 'error.log') -Value $line
+        Write-Host "See $($script:LogDir)\error.log" -ForegroundColor DarkGray
+    } catch { }
+}
+
 # ---------------------------------------------------------------------------
 # Phase 1 - root exploit + TCP 5555 recovery channel
 # ---------------------------------------------------------------------------
@@ -659,9 +684,7 @@ function Invoke-Phase1 {
     # only require them up front for a --skip-build run.
     if (-not $Rebuild) { Assert-BuildOutputs }
 
-    $logDir = Join-Path $LogRoot (Get-Date -Format "yyyyMMdd-HHmmss")
-    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-    Write-Host "Logs:          $logDir"
+    $logDir = $script:LogDir
     Write-Notice "This runs the kernel exploit and reboots the Portal a few times. Keep USB connected."
 
     $pyArgs = @($provisioner, "--serial", $script:Serial, "--persistent-wireless-adb",
@@ -824,9 +847,7 @@ function Invoke-Phase3 {
         Write-Notice "TCP 5555 recovery channel is NOT working; a boot loop would need a factory reset."
     }
 
-    $logDir = Join-Path $LogRoot (Get-Date -Format "yyyyMMdd-HHmmss")
-    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-    Write-Host "Logs:          $logDir"
+    $logDir = $script:LogDir
     Write-Host "Grant cert of: $GrantPackages"
     Write-Notice "This injects Google's cert as a PERMISSION-capable past signature of the framework, then reboots."
 
@@ -1003,8 +1024,7 @@ function Set-PresenceMessengerTrust {
 
     $provisioner = Join-Path $ToolRoot "tools\provision_portal.py"
     if (-not (Test-Path $provisioner)) { throw "Provisioner not found: $provisioner" }
-    $logDir = Join-Path $LogRoot (Get-Date -Format "yyyyMMdd-HHmmss")
-    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $logDir = $script:LogDir
     Write-Notice "Injecting presence's own cert first, then the Messenger cert."
     $env:PORTAL_SKIP_CLEAN_BOOT = "1"
     $pyArgs = @($provisioner, "--serial", $script:Serial, "--permission-grants",
@@ -1139,6 +1159,7 @@ try {
     Bootstrap-Deps
     foreach ($ph in $PhaseCatalogue) {
         if ($wanted.ContainsKey($ph.n)) {
+            $null = New-LogDir
             & $ph.run
             $ran += $ph.n
         } else {
@@ -1149,6 +1170,7 @@ try {
 }
 catch {
     Write-Bad $_.Exception.Message
+    Write-RunError $_.Exception.Message
     Write-Host "PORTAL_PROVISION_FAILED" -ForegroundColor Red
     exit 1
 }
