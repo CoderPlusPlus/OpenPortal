@@ -245,6 +245,21 @@ def print_banner() -> None:
     print(PROVISIONER_BANNER, file=sys.stderr, flush=True)
 
 
+def is_tcp_serial(serial: str) -> bool:
+    """Return whether serial names a TCP target that needs adb connect.
+
+    adb connect takes host[:port] and uses its default port 5555 when the port
+    is left out, so ip:port, a bare IP address and a dotted hostname all need
+    connect. USB serials contain no dot, and adb's mDNS serials end in ._tcp and
+    are reconnected by adb itself.
+    """
+    if ":" in serial:
+        return True
+    if serial.endswith("._tcp"):
+        return False
+    return "." in serial
+
+
 class PortalProvisioner:
     def __init__(
         self,
@@ -379,6 +394,13 @@ class PortalProvisioner:
         self.permission_grants_dump = permission_grants_dump
         self.permission_grants_restore = permission_grants_restore
         self.adb = ["adb", "-s", serial]
+        # adb connects a host with no port on its default 5555, so ip:port, a
+        # bare IP address and a dotted hostname all need connect and disconnect.
+        # USB serials have no dot and are auto-detected, and adb's mDNS serials
+        # end in ._tcp and are reconnected by adb itself. Skipping those also
+        # avoids `disconnect <serial>`, which matches the transport with that
+        # serial and would drop a connected USB device.
+        self._serial_is_explicit_tcp = is_tcp_serial(serial)
         self.target: PortalTarget | None = None
         self.persist_wireless_adb = False
         self.adb_framework_boot_configured = False
@@ -657,14 +679,16 @@ class PortalProvisioner:
         return self.run(self.adb + args, timeout=timeout, check=check)
 
     def connect(self, wait_seconds: int = 150) -> None:
-        try:
-            self.run(["adb", "disconnect", self.serial], timeout=5)
-        except ProvisionError:
-            pass
+        if self._serial_is_explicit_tcp:
+            try:
+                self.run(["adb", "disconnect", self.serial], timeout=5)
+            except ProvisionError:
+                pass
         deadline = time.monotonic() + wait_seconds
         while time.monotonic() < deadline:
             try:
-                self.run(["adb", "connect", self.serial], timeout=5)
+                if self._serial_is_explicit_tcp:
+                    self.run(["adb", "connect", self.serial], timeout=5)
                 state = self.adb_run(["get-state"], timeout=5)
                 completed = self.adb_run(
                     ["shell", "getprop", "sys.boot_completed"], timeout=5
@@ -691,15 +715,17 @@ class PortalProvisioner:
         return before, after
 
     def connect_after_reboot(self, before: str, wait_seconds: int = 600) -> str:
-        try:
-            self.run(["adb", "disconnect", self.serial], timeout=5)
-        except ProvisionError:
-            pass
+        if self._serial_is_explicit_tcp:
+            try:
+                self.run(["adb", "disconnect", self.serial], timeout=5)
+            except ProvisionError:
+                pass
         deadline = time.monotonic() + wait_seconds
         last_boot_id = ""
         while time.monotonic() < deadline:
             try:
-                self.run(["adb", "connect", self.serial], timeout=5)
+                if self._serial_is_explicit_tcp:
+                    self.run(["adb", "connect", self.serial], timeout=5)
                 state = self.adb_run(["get-state"], timeout=5)
                 completed = self.adb_run(
                     ["shell", "getprop", "sys.boot_completed"], timeout=5
@@ -725,7 +751,8 @@ class PortalProvisioner:
                     )
                     if settle_seconds:
                         time.sleep(settle_seconds)
-                        self.run(["adb", "connect", self.serial], timeout=5)
+                        if self._serial_is_explicit_tcp:
+                            self.run(["adb", "connect", self.serial], timeout=5)
                         stable = self.adb_run(
                             ["shell", "getprop", "sys.boot_completed"],
                             timeout=5,
@@ -885,20 +912,6 @@ class PortalProvisioner:
             actions["system_theme_control"] = self.system_theme_control
         return actions
 
-    def tool_revision(self) -> str:
-        result = self.run(
-            ["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], timeout=5
-        )
-        if result.returncode != 0:
-            return "unknown"
-        revision = result.stdout.strip()
-        dirty = self.run(
-            ["git", "-C", str(ROOT), "status", "--porcelain"], timeout=5
-        )
-        if dirty.returncode == 0 and dirty.stdout.strip():
-            revision += "-dirty"
-        return revision
-
     def selected_artifact_hashes(self) -> dict[str, str]:
         candidates = [pathlib.Path(__file__).resolve(), ROOT / "tools/portal_targets.py"]
         if self.target:
@@ -967,7 +980,6 @@ class PortalProvisioner:
             "serial": self.serial,
             "target": self.target.key if self.target else None,
             "fingerprint": fingerprint,
-            "tool_revision": self.tool_revision(),
             "artifact_sha256": self.selected_artifact_hashes(),
             "actions": self.requested_actions(),
             "verification": {
@@ -1785,7 +1797,7 @@ class PortalProvisioner:
             ),
             "host_tools": {
                 name: shutil.which(name) is not None
-                for name in ("adb", "git", "make", "python3")
+                for name in ("adb", "make", "python3")
             },
             "build_outputs": {
                 path: pathlib.Path(path).is_file() for path in required_outputs
@@ -1844,7 +1856,6 @@ class PortalProvisioner:
                 "schema": 1,
                 "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "serial": self.serial,
-                "tool_revision": self.tool_revision(),
                 "sha256": {},
             }
             hashes = manifest["sha256"]
@@ -3708,40 +3719,12 @@ class PortalProvisioner:
         offsets = self.target.kaslr_pc_offsets
         simpleperf = "simpleperf"
         if self.target.bundled_simpleperf:
-            roots = []
-            for name in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK"):
-                value = os.environ.get(name)
-                if value:
-                    roots.append(pathlib.Path(value))
-            for name in ("ANDROID_SDK_ROOT", "ANDROID_HOME"):
-                value = os.environ.get(name)
-                if value:
-                    roots.append(pathlib.Path(value) / "ndk")
-            roots.extend(
-                (
-                    pathlib.Path.home() / "android-sdk/ndk",
-                    pathlib.Path.home() / "Android/Sdk/ndk",
-                )
-            )
-            candidates: list[pathlib.Path] = []
-            for root in roots:
-                if (root / "simpleperf/bin/android/arm64/simpleperf").is_file():
-                    candidates.append(root / "simpleperf/bin/android/arm64/simpleperf")
-                if root.is_dir():
-                    candidates.extend(
-                        sorted(
-                            root.glob("*/simpleperf/bin/android/arm64/simpleperf"),
-                            reverse=True,
-                        )
-                    )
-            local_simpleperf = next(
-                (candidate for candidate in candidates if candidate.is_file()),
-                None,
-            )
+            local_simpleperf = bundled_simpleperf_path()
             if local_simpleperf is None:
                 raise ProvisionError(
                     "this target needs the Android NDK arm64 simpleperf binary; "
-                    "set ANDROID_NDK_HOME to the installed NDK directory"
+                    "set PORTAL_SIMPLEPERF to the binary, or ANDROID_NDK_HOME to "
+                    "the installed NDK directory"
                 )
             simpleperf = "/data/local/tmp/portal-simpleperf"
             self.adb_run(
@@ -4901,7 +4884,8 @@ class PortalProvisioner:
                 recovery_deadline = time.monotonic() + 15
                 while time.monotonic() < recovery_deadline:
                     try:
-                        self.run(["adb", "connect", self.serial], timeout=5)
+                        if self._serial_is_explicit_tcp:
+                            self.run(["adb", "connect", self.serial], timeout=5)
                         watch_result = self.adb_run(
                             [
                                 "shell",
@@ -7521,6 +7505,63 @@ class PortalProvisioner:
         raise ProvisionError(f"provisioning failed after {self.attempts} attempts")
 
 
+def bundled_simpleperf_path() -> pathlib.Path | None:
+    """Return the arm64 simpleperf binary to push, or None when none exists.
+
+    PORTAL_SIMPLEPERF names one exact file and is how OpenPortal supplies its
+    bundled copy. If it is unset or does not point at a file, an installed NDK
+    is searched, newest first.
+    """
+    override = os.environ.get("PORTAL_SIMPLEPERF")
+    if override:
+        try:
+            path = pathlib.Path(override).expanduser()
+        except RuntimeError:
+            path = pathlib.Path(override)
+        if path.is_file():
+            return path
+        print(
+            f"PORTAL_SIMPLEPERF does not name a file ({path}); "
+            "looking for simpleperf in an installed NDK",
+            flush=True,
+        )
+    roots = []
+    for name in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK"):
+        value = os.environ.get(name)
+        if value:
+            roots.append(pathlib.Path(value))
+    for name in ("ANDROID_SDK_ROOT", "ANDROID_HOME"):
+        value = os.environ.get(name)
+        if value:
+            roots.append(pathlib.Path(value) / "ndk")
+    try:
+        home = pathlib.Path.home()
+    except RuntimeError:
+        home = None
+    if home is not None:
+        roots.extend(
+            (
+                home / "android-sdk/ndk",
+                home / "Android/Sdk/ndk",
+            )
+        )
+    candidates: list[pathlib.Path] = []
+    for root in roots:
+        if (root / "simpleperf/bin/android/arm64/simpleperf").is_file():
+            candidates.append(root / "simpleperf/bin/android/arm64/simpleperf")
+        if root.is_dir():
+            candidates.extend(
+                sorted(
+                    root.glob("*/simpleperf/bin/android/arm64/simpleperf"),
+                    reverse=True,
+                )
+            )
+    return next(
+        (candidate for candidate in candidates if candidate.is_file()),
+        None,
+    )
+
+
 def android_build_environment(
     target: PortalTarget | None = None,
 ) -> dict[str, str]:
@@ -7546,7 +7587,7 @@ def android_build_environment(
     ndk_value = next(
         (
             environment[name]
-            for name in ("NDK", "ANDROID_NDK_HOME", "ANDROID_NDK_ROOT")
+            for name in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK")
             if environment.get(name)
         ),
         None,

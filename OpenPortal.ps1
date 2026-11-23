@@ -52,8 +52,12 @@
     Max exploit attempts passed to the provisioner (1..100). Default 12.
 
 .PARAMETER Rebuild
-    Build the exploit before provisioning. Off by default (uses existing build
-    outputs), which is what you want for a quick restore.
+    Check the payload-build requirements. The build is Linux only and this
+    Windows launcher cannot run it, so -Rebuild stops with the requirements
+    instead of building. Off by default, which uses the prebuilt payloads in the
+    repo and is what you want for a quick restore. To rebuild, run the
+    provisioner on a Linux host (WSL counts), then run OpenPortal without
+    -Rebuild.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\OpenPortal.ps1
@@ -188,6 +192,25 @@ function Download-File {
     $prev = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'
     try { Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing } finally { $ProgressPreference = $prev }
+    Move-Item -LiteralPath $tmp -Destination $OutFile -Force
+}
+
+function Download-Base64File {
+    param([string]$Url, [string]$OutFile, [string]$DisplayName = "")
+    New-Item -ItemType Directory -Force -Path (Split-Path $OutFile -Parent) | Out-Null
+    $label = if ($DisplayName) { $DisplayName } else { Split-Path $OutFile -Leaf }
+    Write-Notice "downloading $label ..."
+    $prev = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try { $response = Invoke-WebRequest -Uri $Url -UseBasicParsing } finally { $ProgressPreference = $prev }
+    $encoded = if ($response.Content -is [byte[]]) {
+        [Text.Encoding]::ASCII.GetString($response.Content)
+    } else {
+        [string]$response.Content
+    }
+    try { $bytes = [Convert]::FromBase64String($encoded) } catch { throw "Could not decode the download from $Url." }
+    $tmp = "$OutFile.download"
+    [IO.File]::WriteAllBytes($tmp, $bytes)
     Move-Item -LiteralPath $tmp -Destination $OutFile -Force
 }
 
@@ -338,12 +361,229 @@ function Ensure-Python {
     return $py
 }
 
+# The published simpleperf binary: exact size, SHA-256 and ELF magic. A partial
+# file left by an interrupted download fails this, so it is fetched again.
+function Test-SimpleperfBinary {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    if ((Get-Item -LiteralPath $Path).Length -ne 4106416) { return $false }
+    $hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    if ($hash -ne "7EB29ECBA8AE792397BD8C1B0FCD874FED0DC4C44D0CF9CB284E948F80CFE7E5") { return $false }
+    $magic = New-Object byte[] 4
+    $stream = [IO.File]::OpenRead($Path)
+    try { $magicRead = $stream.Read($magic, 0, 4) } finally { $stream.Close() }
+    return $magicRead -eq 4 -and $magic[0] -eq 0x7F -and $magic[1] -eq 0x45 -and $magic[2] -eq 0x4C -and $magic[3] -eq 0x46
+}
+
+function Ensure-Simpleperf {
+    # The exploit needs simpleperf (arm64 Android binary) for KASLR discovery.
+    # The bundled copy is always the one used, even when a real NDK is installed:
+    # deps\ndk holds only this binary, so it must never become the NDK a build
+    # uses. The provisioner takes the path from PORTAL_SIMPLEPERF and still finds
+    # a real NDK for builds through ANDROID_NDK_HOME, ANDROID_NDK_ROOT, NDK or
+    # the SDK.
+    $bundledNdk = Join-Path $script:DepsDir "ndk"
+    $expected = Join-Path $bundledNdk "simpleperf\bin\android\arm64\simpleperf"
+    if (Test-SimpleperfBinary $expected) {
+        Write-Host "simpleperf: $expected"
+    } else {
+        if (Test-Path -LiteralPath $expected) {
+            Write-Notice "simpleperf is damaged; fetching a fresh copy ..."
+        } else {
+            Write-Notice "simpleperf not found; fetching from AOSP prebuilts ..."
+        }
+        $dir = Join-Path $bundledNdk "simpleperf\bin\android\arm64"
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $tmpFile = Join-Path $script:DepsDir "simpleperf.download"
+        Download-Base64File "https://android.googlesource.com/platform/prebuilts/simpleperf/+/refs/tags/ndk-r28c/bin/android/arm64/simpleperf?format=TEXT" $tmpFile -DisplayName "simpleperf"
+        if (-not (Test-SimpleperfBinary $tmpFile)) {
+            $actualSha256 = (Get-FileHash -LiteralPath $tmpFile -Algorithm SHA256).Hash
+            $size = (Get-Item -LiteralPath $tmpFile).Length
+            Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
+            throw "simpleperf download failed verification (sha256=$actualSha256 size=$size)."
+        }
+        Move-Item -LiteralPath $tmpFile -Destination $expected -Force
+        Write-Host "simpleperf: $expected  (downloaded)"
+    }
+    $env:PORTAL_SIMPLEPERF = $expected
+}
+
+function Get-AndroidSdkRoot {
+    # Same order the provisioner resolves: an explicit -SdkRoot, then the
+    # environment, then the user's home folders, then the Windows default. The
+    # child names use forward slashes so the home folders also resolve on Linux.
+    $roots = @($SdkRoot, $env:ANDROID_SDK_ROOT, $env:ANDROID_HOME)
+    $homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } elseif ($env:HOME) { $env:HOME } else { $null }
+    if ($homeDir) {
+        $roots += @(
+            (Join-Path $homeDir "Android/Sdk"),
+            (Join-Path $homeDir "Android/sdk"),
+            (Join-Path $homeDir "android-sdk")
+        )
+    }
+    if ($env:LOCALAPPDATA) { $roots += (Join-Path $env:LOCALAPPDATA "Android/Sdk") }
+    foreach ($root in $roots) {
+        if ($root -and (Test-Path -LiteralPath $root)) { return $root }
+    }
+    return $null
+}
+
+function Test-AnyFile {
+    param([string]$Directory, [string[]]$Names)
+    foreach ($name in $Names) {
+        $path = Join-Path $Directory $name
+        if (Test-Path -LiteralPath $path) { return $path }
+    }
+    return $null
+}
+
+function Format-CheckLine {
+    param([bool]$Found, [string]$Label, [string]$Path)
+    $mark = if ($Found) { "[x]" } else { "[ ]" }
+    if ($Found -and $Path) { return ("  {0} {1}    {2}" -f $mark, $Label, $Path) }
+    return ("  {0} {1}" -f $mark, $Label)
+}
+
+function Assert-RebuildToolchain {
+    $sdk = Get-AndroidSdkRoot
+
+    $makeCmd = Get-Command make -CommandType Application -ErrorAction SilentlyContinue
+    $makePath = if ($makeCmd) { $makeCmd.Source } else { $null }
+
+    $javac = Get-Command javac -CommandType Application -ErrorAction SilentlyContinue
+    $jarTool = Get-Command jar -CommandType Application -ErrorAction SilentlyContinue
+    $keytool = Get-Command keytool -CommandType Application -ErrorAction SilentlyContinue
+    $jdkFound = [bool]($javac -and $jarTool -and $keytool)
+    $jdkPath = if ($jdkFound) { Split-Path $javac.Source -Parent } else { $null }
+
+    # Each tool is accepted in the Unix form the Linux build uses or the Windows
+    # form an installed SDK ships, so this list reports what the machine has.
+    # Whether it can build here is the separate Linux host line below.
+    $toolNames = @{
+        aapt      = @("aapt", "aapt.exe")
+        apksigner = @("apksigner", "apksigner.bat", "apksigner.exe")
+        zipalign  = @("zipalign", "zipalign.exe")
+        d8        = @("d8", "d8.bat", "d8.exe")
+    }
+
+    $ndkPath = $null
+    $ndkCandidates = @()
+    foreach ($name in @("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK")) {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if ($value) { $ndkCandidates += $value }
+    }
+    # Only the version the provisioner defaults to counts, so a different NDK
+    # sitting in the SDK is not reported as the one a build would use.
+    if ($sdk) { $ndkCandidates += (Join-Path $sdk "ndk/28.2.13676358") }
+    $bundledNdk = Join-Path $script:DepsDir "ndk"
+    foreach ($candidate in $ndkCandidates) {
+        if (-not $candidate -or -not (Test-Path -LiteralPath $candidate)) { continue }
+        if ($candidate -ieq $bundledNdk) { continue }
+        if (Test-Path -LiteralPath (Join-Path $candidate "toolchains/llvm/prebuilt")) {
+            $ndkPath = $candidate
+            break
+        }
+    }
+
+    $androidJarPath = $null
+    if ($env:ANDROID_JAR -and (Test-Path -LiteralPath $env:ANDROID_JAR)) {
+        $androidJarPath = $env:ANDROID_JAR
+    } elseif ($sdk) {
+        $candidate = Join-Path $sdk "platforms/android-36/android.jar"
+        if (Test-Path -LiteralPath $candidate) { $androidJarPath = $candidate }
+    }
+
+    $buildToolsDir = $null
+    if ($env:BUILD_TOOLS -and (Test-Path -LiteralPath $env:BUILD_TOOLS)) {
+        $buildToolsDir = $env:BUILD_TOOLS
+    } elseif ($sdk) {
+        $candidate = Join-Path $sdk "build-tools/37.0.0"
+        if (Test-Path -LiteralPath $candidate) { $buildToolsDir = $candidate }
+    }
+    $buildToolsPath = $null
+    if ($buildToolsDir) {
+        $d8Path = $null
+        $d8Usable = $true
+        if ($env:D8) {
+            # The override has to be a d8 of an accepted shape, the same rule the
+            # folder search below uses.
+            $override = Get-Item -LiteralPath $env:D8 -ErrorAction SilentlyContinue
+            if ($override -and ($toolNames["d8"] -contains $override.Name)) {
+                $d8Path = $override.FullName
+            } else {
+                $d8Usable = $false
+            }
+        }
+        if (-not $d8Path -and $d8Usable) {
+            $d8Path = Test-AnyFile $buildToolsDir $toolNames["d8"]
+        }
+        if ($d8Path) {
+            $toolsFound = $true
+            foreach ($tool in @("aapt", "apksigner", "zipalign")) {
+                if (-not (Test-AnyFile $buildToolsDir $toolNames[$tool])) {
+                    $toolsFound = $false
+                    break
+                }
+            }
+            if ($toolsFound) { $buildToolsPath = $buildToolsDir }
+        }
+    }
+
+    # The payload build is Linux only, so a Windows host can show every tool as
+    # present and still not be able to build. That is reported as its own
+    # requirement, and the path uses forward slashes so it resolves on Linux too.
+    $linuxCompiler = $null
+    if ($ndkPath) {
+        $candidate = Join-Path $ndkPath "toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang"
+        if (Test-Path -LiteralPath $candidate) { $linuxCompiler = $candidate }
+    }
+    $isLinuxHost = $false
+    if (Get-Variable -Name IsLinux -Scope Global -ErrorAction SilentlyContinue) {
+        $isLinuxHost = [bool]$IsLinux
+    }
+    $linuxHostReady = $isLinuxHost -and [bool]$linuxCompiler
+
+    $lines = @(
+        "-Rebuild compiles the exploit payloads from source, but the build is",
+        "Linux only. OpenPortal normally uses the prebuilt payloads in the repo, so",
+        "this is only needed if you changed the exploit or helper source.",
+        "",
+        "OpenPortal provides these automatically:",
+        "  [x] adb",
+        "  [x] Python",
+        "  [x] Java runtime (JRE)",
+        "  [x] apksig",
+        "  [x] simpleperf",
+        "",
+        "-Rebuild needs these on the build host (NDK 28.2.13676358):",
+        (Format-CheckLine ([bool]$makePath) "GNU Make" $makePath),
+        (Format-CheckLine $jdkFound "JDK (javac, jar, keytool)" $jdkPath),
+        (Format-CheckLine ([bool]$ndkPath) "Android NDK" $ndkPath),
+        (Format-CheckLine ([bool]$androidJarPath) "Android SDK Platform 36 (android.jar)" $androidJarPath),
+        (Format-CheckLine ([bool]$buildToolsPath) "Android SDK Build Tools 37.0.0 (aapt, zipalign, apksigner, d8)" $buildToolsPath),
+        "",
+        "-Rebuild also needs a Linux build host:",
+        (Format-CheckLine $linuxHostReady "Linux with the NDK's linux-x86_64 toolchain" $linuxCompiler),
+        "",
+        "The native payloads are built with the NDK's linux-x86_64 toolchain. This",
+        "Windows launcher only has Windows tools, so -Rebuild cannot run the build",
+        "here. Build on a Linux host (WSL counts) by running the provisioner there,",
+        "then run OpenPortal without -Rebuild to use the prebuilt payloads."
+    )
+    throw ($lines -join [Environment]::NewLine)
+}
+
+# adb is always needed. The other tools are fetched only when a selected phase
+# uses them, so a Google-stack or Play-Store run does not depend on downloads it
+# never touches.
 function Bootstrap-Deps {
-    Write-Phase "Checking tools (adb, Java, Python, apksig)"
+    param([string[]]$Needs = @("java", "python", "apksig", "simpleperf"))
+    Write-Phase "Checking tools"
     Ensure-Adb
-    Ensure-Java
-    $script:PythonExe = Ensure-Python
-    $null = Ensure-Apksig
+    if ($Needs -contains "java") { Ensure-Java }
+    if ($Needs -contains "python") { $script:PythonExe = Ensure-Python }
+    if ($Needs -contains "apksig") { $null = Ensure-Apksig }
+    if ($Needs -contains "simpleperf") { Ensure-Simpleperf }
     Write-Ok "tools ready"
 }
 
@@ -913,8 +1153,8 @@ function Invoke-Phase4 {
 # Phase 5 helpers - read APK signing certs
 # ---------------------------------------------------------------------------
 # Returns the cert (hex DER + sha256) that Android <Sdk> would use for <Apk>.
-# Uses the precompiled tools\ExtractApkCert.class with apksig (found or fetched
-# by Bootstrap-Deps).
+# Uses tools\ExtractApkCert.class with apksig (found or fetched by
+# Bootstrap-Deps), or the .java source when the class is missing or older.
 function Get-ApkSignerCert {
     param([string]$Apk, [int]$Sdk)
     $java = Get-JavaPath
@@ -924,17 +1164,23 @@ function Get-ApkSignerCert {
     $classDir = Join-Path $PSScriptRoot "tools"
     $class = Join-Path $classDir "ExtractApkCert.class"
     $src = Join-Path $classDir "ExtractApkCert.java"
+    $hasClass = Test-Path -LiteralPath $class
+    $hasSource = Test-Path -LiteralPath $src
+    if (-not $hasClass -and -not $hasSource) {
+        throw "The ExtractApkCert tool is missing from tools\."
+    }
+    # The committed class is what the bundled JRE can run. If you change the
+    # source, rebuild the class as described in AGENTS.md.
+    $runSource = -not $hasClass -and $hasSource
     # java writes to stderr for warnings or a missing signer; under
     # $ErrorActionPreference=Stop that would throw before we can read the output.
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        if (Test-Path -LiteralPath $class) {
-            $out = @(& $java -cp "$jar;$classDir" ExtractApkCert $Apk $Sdk 2>&1 | ForEach-Object { "$_" })
-        } elseif (Test-Path -LiteralPath $src) {
+        if ($runSource) {
             $out = @(& $java -cp $jar $src $Apk $Sdk 2>&1 | ForEach-Object { "$_" })
         } else {
-            throw "The ExtractApkCert tool is missing from tools\."
+            $out = @(& $java -cp "$jar;$classDir" ExtractApkCert $Apk $Sdk 2>&1 | ForEach-Object { "$_" })
         }
     } finally { $ErrorActionPreference = $prev }
     $hex = ($out | Where-Object { $_ -match '^DER=([0-9a-fA-F]+)' } | ForEach-Object { $Matches[1] } | Select-Object -First 1)
@@ -1014,6 +1260,10 @@ $script:MessengerCertHex = "30820268308201d102044a9c4610300d06092a864886f70d0101
 # signatures, then reboot.  Returns the presence (host) signing-cert object.
 function Set-PresenceMessengerTrust {
     param([Parameter(Mandatory)][string]$ClientCertHex)
+    # This run installs the UID-1000 helper and boot hook, so a --skip-build run
+    # needs those prebuilt files before any device work starts. A device that is
+    # already patched never gets here, so it is not blocked by the check.
+    if (-not $Rebuild) { Assert-BuildOutputs }
     $sdk = [int](Invoke-AdbQuiet shell getprop ro.build.version.sdk).Output
     $remote = (Invoke-AdbQuiet shell "ls /system/priv-app/aloha_presence_release/ | grep -i '\.apk'").Output.Trim()
     if (-not $remote) { throw "Could not locate the installed presence APK." }
@@ -1125,13 +1375,15 @@ if (-not (Confirm-RiskWarning)) {
 }
 
 # Phase catalogue, in order. Only the phases named in -Phases are run; the rest
-# print a single "[Skipped]" line.
+# print a single "[Skipped]" line. needsBuild marks the phases that run the
+# provisioner without --skip-build, so -Rebuild has something to compile. deps
+# names the host tools a phase needs beyond adb.
 $PhaseCatalogue = @(
-    @{ n = 1; label = "Phase 1 - root exploit + TCP 5555 recovery channel";                     run = { Invoke-Phase1 } },
-    @{ n = 2; label = "Phase 2 - install the real Google stack (no stub)";                      run = { Invoke-Phase2 } },
-    @{ n = 3; label = "Phase 3 - grant the Google apps their signature|privileged permissions"; run = { Invoke-Phase3 } },
-    @{ n = 4; label = "Phase 4 - allow Play Store installs + verify Google Services";           run = { Invoke-Phase4 } },
-    @{ n = 5; label = "Phase 5 - genuine Messenger (no rename/re-sign workaround)";             run = { Invoke-Phase5 } }
+    @{ n = 1; label = "Phase 1 - root exploit + TCP 5555 recovery channel";                     needsBuild = $true;  deps = @("python", "simpleperf");                    run = { Invoke-Phase1 } },
+    @{ n = 2; label = "Phase 2 - install the real Google stack (no stub)";                      needsBuild = $false; deps = @();                                           run = { Invoke-Phase2 } },
+    @{ n = 3; label = "Phase 3 - grant the Google apps their signature|privileged permissions"; needsBuild = $true;  deps = @("python", "simpleperf");                    run = { Invoke-Phase3 } },
+    @{ n = 4; label = "Phase 4 - allow Play Store installs + verify Google Services";           needsBuild = $false; deps = @();                                           run = { Invoke-Phase4 } },
+    @{ n = 5; label = "Phase 5 - genuine Messenger (no rename/re-sign workaround)";             needsBuild = $true;  deps = @("python", "simpleperf", "java", "apksig"); run = { Invoke-Phase5 } }
 )
 $KnownPhases = @($PhaseCatalogue | ForEach-Object { $_.n })
 
@@ -1152,11 +1404,15 @@ if ($unknown.Count -gt 0) {
 }
 
 $selected = @($PhaseCatalogue | Where-Object { $wanted.ContainsKey($_.n) } | ForEach-Object { $_.n })
+# Phases that never build (2 and 4) must not be blocked by a missing toolchain.
+$selectedBuilds = @($PhaseCatalogue | Where-Object { $wanted.ContainsKey($_.n) -and $_.needsBuild }).Count -gt 0
+$selectedDeps = @($PhaseCatalogue | Where-Object { $wanted.ContainsKey($_.n) } | ForEach-Object { $_.deps } | Select-Object -Unique)
 Write-Host "Meta Portal+ provisioning - phases: $($selected -join ',')" -ForegroundColor White
 
 $ran = @()
 try {
-    Bootstrap-Deps
+    if ($Rebuild -and $selectedBuilds) { Assert-RebuildToolchain }
+    Bootstrap-Deps -Needs $selectedDeps
     foreach ($ph in $PhaseCatalogue) {
         if ($wanted.ContainsKey($ph.n)) {
             $null = New-LogDir

@@ -1480,11 +1480,10 @@ entry and preload output.
 
 143. Added the `--profile kiosk` action set, `--status`, `--dry-run`, private
 backup archives, a persistent operation manifest, and `--recover`. The state
-manifest records selected actions, exact target and fingerprint, source
-revision, artifact SHA-256 values, state, and verification boots. Recovery
-cleans stale staged binaries and resumes only a schema-validated pending
-manifest. Kiosk Satellite APK acquisition remains a manual step and is not
-part of the profile.
+manifest records selected actions, exact target and fingerprint, artifact
+SHA-256 values, state, and verification boots. Recovery cleans stale staged
+binaries and resumes only a schema-validated pending manifest. Kiosk Satellite
+APK acquisition remains a manual step and is not part of the profile.
 
 144. Added a resolver-backed privacy action using Android 10 strict Private
 DNS. A test with `dns.google` survived boots

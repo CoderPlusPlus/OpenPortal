@@ -1,7 +1,11 @@
 # Compiled output
 *.class
+!tools/ExtractApkCert.class
 *.o
 *.so
+
+# Downloaded tools
+deps/*
 
 # Android build artifacts
 *.apk

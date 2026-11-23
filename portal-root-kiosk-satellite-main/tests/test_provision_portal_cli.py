@@ -23,6 +23,8 @@ from provision_portal import (  # noqa: E402
     ProvisionError,
     android_build_environment,
     build,
+    bundled_simpleperf_path,
+    is_tcp_serial,
     parse_args,
 )
 from meta_debloat_components import (  # noqa: E402
@@ -30,6 +32,77 @@ from meta_debloat_components import (  # noqa: E402
     PORTAL_PLUS_ALOHA_SAFE_COMPONENT_NAMES,
 )
 from portal_targets import TARGETS  # noqa: E402
+
+
+class SerialTransportTest(unittest.TestCase):
+    def test_tcp_serials_use_connect_and_disconnect(self) -> None:
+        for serial in ("192.0.2.1:5555", "192.168.1.72", "portal.local"):
+            with self.subTest(serial=serial):
+                with tempfile.TemporaryDirectory() as temporary:
+                    provisioner = PortalProvisioner(
+                        serial, 1, pathlib.Path(temporary)
+                    )
+                    self.assertTrue(provisioner._serial_is_explicit_tcp)
+                    ready = subprocess.CompletedProcess([], 0, stdout="1\n")
+                    with mock.patch.object(
+                        PortalProvisioner, "run", return_value=ready
+                    ) as run:
+                        provisioner.connect(wait_seconds=5)
+
+                commands = [call.args[0] for call in run.call_args_list]
+                disconnect = ["adb", "disconnect", serial]
+                connect = ["adb", "connect", serial]
+                self.assertIn(disconnect, commands)
+                self.assertIn(connect, commands)
+                self.assertLess(
+                    commands.index(disconnect), commands.index(connect)
+                )
+
+    def test_usb_and_mdns_serials_skip_explicit_transport(self) -> None:
+        for serial in ("818PGA02P1200D15", "adb-XXXX._adb-tls-connect._tcp"):
+            with self.subTest(serial=serial):
+                with tempfile.TemporaryDirectory() as temporary:
+                    provisioner = PortalProvisioner(
+                        serial, 1, pathlib.Path(temporary)
+                    )
+                    self.assertFalse(provisioner._serial_is_explicit_tcp)
+                    ready = subprocess.CompletedProcess([], 0, stdout="1\n")
+                    with mock.patch.object(
+                        PortalProvisioner, "run", return_value=ready
+                    ) as run:
+                        provisioner.connect(wait_seconds=5)
+
+                commands = [call.args[0] for call in run.call_args_list]
+                self.assertFalse(
+                    [
+                        command
+                        for command in commands
+                        if "connect" in command or "disconnect" in command
+                    ],
+                    commands,
+                )
+
+
+class TcpSerialTest(unittest.TestCase):
+    def test_network_targets_are_recognised(self) -> None:
+        for serial in (
+            "192.0.2.1:5555",
+            "192.168.1.72",
+            "portal.local",
+            "portal.example.com:5555",
+        ):
+            with self.subTest(serial=serial):
+                self.assertTrue(is_tcp_serial(serial))
+
+    def test_usb_and_mdns_serials_are_not_network_targets(self) -> None:
+        for serial in (
+            "818PGA02P1200D15",
+            "emulator-5554",
+            "adb-XXXX._adb-tls-connect._tcp",
+            "adb-XXXX._adb-tls-pairing._tcp",
+        ):
+            with self.subTest(serial=serial):
+                self.assertFalse(is_tcp_serial(serial))
 
 
 class PersistentWirelessAdbCliTest(unittest.TestCase):
@@ -304,6 +377,32 @@ class SystemThemeControlCliTest(unittest.TestCase):
         )
 
 
+def create_ndk_toolchain(ndk: pathlib.Path) -> None:
+    toolchain = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin"
+    for name in (
+        "aarch64-linux-android29-clang",
+        "armv7a-linux-androideabi28-clang",
+        "armv7a-linux-androideabi29-clang",
+    ):
+        path = toolchain / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+
+
+def create_sdk_tools(sdk: pathlib.Path) -> pathlib.Path:
+    build_tools = sdk / "build-tools" / "37.0.0"
+    for path in (
+        build_tools / "aapt",
+        build_tools / "apksigner",
+        build_tools / "zipalign",
+        build_tools / "d8",
+        sdk / "platforms" / "android-36" / "android.jar",
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    return build_tools
+
+
 class AndroidBuildEnvironmentTest(unittest.TestCase):
     def test_build_files_do_not_contain_an_author_home_path(self) -> None:
         build_files = [ROOT / "android-env.mk", *ROOT.glob("*/Makefile")]
@@ -314,21 +413,8 @@ class AndroidBuildEnvironmentTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             sdk = pathlib.Path(temporary) / "sdk"
             ndk = sdk / "ndk" / "28.2.13676358"
-            toolchain = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin"
-            build_tools = sdk / "build-tools" / "37.0.0"
-            platform = sdk / "platforms" / "android-36"
-            for path in (
-                toolchain / "aarch64-linux-android29-clang",
-                toolchain / "armv7a-linux-androideabi28-clang",
-                toolchain / "armv7a-linux-androideabi29-clang",
-                build_tools / "aapt",
-                build_tools / "apksigner",
-                build_tools / "zipalign",
-                build_tools / "d8",
-                platform / "android.jar",
-            ):
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.touch()
+            create_ndk_toolchain(ndk)
+            build_tools = create_sdk_tools(sdk)
 
             with (
                 mock.patch.dict(
@@ -344,6 +430,31 @@ class AndroidBuildEnvironmentTest(unittest.TestCase):
         self.assertEqual(environment["ANDROID_SDK_ROOT"], str(sdk))
         self.assertEqual(environment["NDK"], str(ndk))
         self.assertEqual(environment["BUILD_TOOLS"], str(build_tools))
+
+    def test_installed_ndk_is_used_instead_of_a_legacy_ndk_variable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            sdk = root / "sdk"
+            ndk = root / "ndk"
+            create_ndk_toolchain(ndk)
+            create_sdk_tools(sdk)
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "ANDROID_SDK_ROOT": str(sdk),
+                        "ANDROID_NDK_HOME": str(ndk),
+                        "NDK": str(root / "simpleperf-only"),
+                    },
+                    clear=True,
+                ),
+                mock.patch.object(shutil, "which", return_value="/usr/bin/tool"),
+            ):
+                environment = android_build_environment()
+
+        self.assertEqual(environment["NDK"], str(ndk))
+        self.assertEqual(environment["ANDROID_NDK_HOME"], str(ndk))
 
     def test_missing_sdk_fails_with_configuration_help(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -361,6 +472,54 @@ class AndroidBuildEnvironmentTest(unittest.TestCase):
                     "no Portal changes were made.*ANDROID_SDK_ROOT",
                 ):
                     android_build_environment()
+
+
+class BundledSimpleperfTest(unittest.TestCase):
+    def test_portal_simpleperf_names_the_file_to_push(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = pathlib.Path(temporary) / "simpleperf"
+            binary.touch()
+            with mock.patch.dict(
+                os.environ, {"PORTAL_SIMPLEPERF": str(binary)}, clear=True
+            ):
+                self.assertEqual(bundled_simpleperf_path(), binary)
+
+    def test_portal_simpleperf_must_point_at_an_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = pathlib.Path(temporary) / "simpleperf"
+            with (
+                mock.patch.dict(
+                    os.environ, {"PORTAL_SIMPLEPERF": str(missing)}, clear=True
+                ),
+                mock.patch.object(
+                    pathlib.Path, "home", return_value=pathlib.Path(temporary)
+                ),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            ):
+                self.assertIsNone(bundled_simpleperf_path())
+            self.assertIn(str(missing), stdout.getvalue())
+
+    def test_broken_override_falls_back_to_an_installed_ndk(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            ndk = root / "ndk"
+            binary = ndk / "simpleperf/bin/android/arm64/simpleperf"
+            binary.parent.mkdir(parents=True)
+            binary.touch()
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "PORTAL_SIMPLEPERF": str(root / "gone"),
+                        "ANDROID_NDK_HOME": str(ndk),
+                    },
+                    clear=True,
+                ),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            ):
+                self.assertEqual(bundled_simpleperf_path(), binary)
+            self.assertIn("PORTAL_SIMPLEPERF", stdout.getvalue())
+
 
 class AdbAuthorizationTimeoutCliTest(unittest.TestCase):
     def test_standalone_flag_needs_no_root_action(self) -> None:
@@ -652,6 +811,7 @@ class ShizukuCliTest(unittest.TestCase):
                 1,
                 pathlib.Path(temporary),
                 shizuku=True,
+                skip_build=True,
             )
             with (
                 mock.patch.object(provisioner, "connect"),
@@ -809,14 +969,16 @@ class RemoteWipeCliTest(unittest.TestCase):
             def action_process(
                 *args: object, **kwargs: object
             ) -> subprocess.Popen[bytes]:
+                script = (
+                    "import sys, time\n"
+                    "sys.stdout.write('OTA block file install ok=1\\n')\n"
+                    "sys.stdout.write('component ctl child=123 status=00000000 "
+                    "ok=1 uid=0 euid=0\\n')\n"
+                    "sys.stdout.flush()\n"
+                    "time.sleep(30)\n"
+                )
                 process = real_popen(
-                    [
-                        "/bin/sh",
-                        "-c",
-                        "printf 'OTA block file install ok=1\\n"
-                        "component ctl child=123 status=00000000 ok=1 "
-                        "uid=0 euid=0\\n'; sleep 30",
-                    ],
+                    [sys.executable, "-c", script],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     bufsize=0,

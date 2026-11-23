@@ -300,8 +300,8 @@ and its verifier require no post-reboot user interaction.
 The provisioner now has a read-only `--status` report, mutation-free
 `--dry-run`, mode-0600 `--backup` archives with SHA-256 manifests, and
 `--recover` for a pending provisioning manifest. Every mutating operation
-records its target key, exact firmware fingerprint, action map, Git revision,
-artifact hashes, and two verification boot IDs at
+records its target key, exact firmware fingerprint, action map, artifact
+hashes, and two verification boot IDs at
 `/data/local/tmp/portal-provision-state-v1.json`. Exact-build selection is
 centralized in `tools/portal_targets.py`; an unlisted device or fingerprint
 cannot reach a build-specific kernel write.

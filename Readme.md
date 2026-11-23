@@ -58,9 +58,9 @@ Before you start, gather these:
 
    If any of these are missing, the script will tell you exactly which one it needs.
 
-The script fetches its own helper tools (adb, Java, Python, and a small library for reading
-app signatures) automatically, and it can download Messenger by itself too — so those four
-Google files are the only things you have to gather by hand.
+The script fetches its own helper tools (adb, Java, Python, a small library for reading
+app signatures, and simpleperf) automatically, and it can download Messenger by itself
+too — so those four Google files are the only things you have to gather by hand.
 
 ### Steps
 
@@ -123,22 +123,22 @@ https://github.com/lukasmaar/kernelsnitch
 **Public domain** · © Bob Jenkins
 https://burtleburtle.net/bob/hash/
 
-**apksig** — reads an app's signing certificate, so OpenPortal can match Messenger's.
-
-Licensed under the **Apache License 2.0** · © The Android Open Source Project
-https://android.googlesource.com/platform/tools/apksig
-
 **apkeep** — downloads the genuine Messenger app.
 
 Licensed under the **MIT License** · © Electronic Frontier Foundation (EFF)
 https://github.com/EFForg/apkeep
 
-The three below are downloaded from their official sources when they're needed, and aren't part of this package.  They're thanked here, but OpenPortal doesn't redistribute them.
+The tools below are downloaded from their official sources when they're needed, and aren't part of this package.  They're thanked here, but OpenPortal doesn't redistribute them.
 
 **Android SDK Platform-Tools (adb)** — how OpenPortal talks to the Portal over USB.
 
 Licensed under the **Apache License 2.0** · © Google
 https://developer.android.com/tools/releases/platform-tools
+
+**apksig** — reads an app's signing certificate, so OpenPortal can match Messenger's.
+
+Licensed under the **Apache License 2.0** · © The Android Open Source Project
+https://android.googlesource.com/platform/tools/apksig
 
 **Eclipse Temurin (Java)** — runs the small helper that reads app signatures.
 
@@ -149,5 +149,10 @@ https://adoptium.net/
 
 Licensed under the **Python Software Foundation License** · © Python Software Foundation
 https://www.python.org/
+
+**simpleperf** — finds the kernel's memory layout before the exploit runs.
+
+Licensed under the **Apache License 2.0** · © The Android Open Source Project
+https://android.googlesource.com/platform/prebuilts/simpleperf
 
 The full text of every license listed above is in the **`THIRD-PARTY-NOTICES.md`** file next to this Readme.  OpenPortal's own code is released into the public domain under the **Unlicense** — see the **`LICENSE`** file.

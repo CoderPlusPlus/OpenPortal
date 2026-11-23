@@ -65,7 +65,7 @@ Persistent features use focused configuration changes or small boot helpers.
 
 ### Host computer
 
-- Linux x86_64 with Git, GNU Make, Python 3.9 or newer and Android Debug Bridge (`adb`)
+- Linux x86_64 with GNU Make, Python 3.9 or newer and Android Debug Bridge (`adb`)
 - Android NDK r28.2 (`28.2.13676358`)
 - A JDK plus Android SDK Platform 36 and Build Tools containing `aapt`, `zipalign`, `apksigner` and `d8`
 - A USB data cable for initial stock-device setup
@@ -129,14 +129,17 @@ adb shell uname -a
 
 ### 1. Install and configure the host tools
 
-Install the tools listed under [Requirements](#requirements), then clone the
-repository. The provisioner automatically finds an SDK installed at
-`$HOME/Android/Sdk` or `$HOME/android-sdk`.
+Install the tools listed under [Requirements](#requirements), then download the
+repository (the green **Code** button on GitHub, then **Download ZIP**) and
+unpack it. If you already have Git, cloning works too:
 
 ```sh
 git clone https://github.com/jxlarrea/portal-root-kiosk-satellite.git
 cd portal-root-kiosk-satellite
 ```
+
+The provisioner automatically finds an SDK installed at `$HOME/Android/Sdk` or
+`$HOME/android-sdk`.
 
 If your SDK is somewhere else, set these paths in the terminal where you run
 the provisioner:
@@ -1255,9 +1258,9 @@ configuration, so store it as sensitive data.
 
 Every mutating run writes a state manifest at
 `/data/local/tmp/portal-provision-state-v1.json`. It records the exact target,
-firmware fingerprint, selected actions, Git revision, artifact hashes, state,
-and verification boot IDs. If power or the host fails during a run, reconnect
-ADB and resume the pending action set with:
+firmware fingerprint, selected actions, artifact hashes, state, and verification
+boot IDs. If power or the host fails during a run, reconnect ADB and resume the
+pending action set with:
 
 ```sh
 python3 tools/provision_portal.py \

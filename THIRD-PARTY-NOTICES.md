@@ -209,16 +209,6 @@ limitations under the License.
 
 ---
 
-## apksig
-
-Reads an app's signing certificate.
-
-- Copyright © 2016 The Android Open Source Project
-- License: Apache License 2.0 (reproduced above)
-- Source: https://android.googlesource.com/platform/tools/apksig
-
----
-
 ## KernelSnitch
 
 The timing side-channel technique used by the exploit.
@@ -286,7 +276,11 @@ and does not include or redistribute them:
 
 - **Android SDK Platform-Tools (adb)** — Apache License 2.0 — © Google
   https://developer.android.com/tools/releases/platform-tools
+- **apksig** — Apache License 2.0 — © The Android Open Source Project
+  https://android.googlesource.com/platform/tools/apksig
 - **Eclipse Temurin (Java)** — GPLv2 with the Classpath Exception — © Eclipse Adoptium
   https://adoptium.net/
 - **Python** — Python Software Foundation License — © Python Software Foundation
   https://www.python.org/
+- **simpleperf** — Apache License 2.0 — © The Android Open Source Project
+  https://android.googlesource.com/platform/prebuilts/simpleperf
