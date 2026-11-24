@@ -409,9 +409,10 @@ function Ensure-Simpleperf {
 }
 
 function Get-AndroidSdkRoot {
-    # Same order the provisioner resolves: an explicit -SdkRoot, then the
-    # environment, then the user's home folders, then the Windows default. The
-    # child names use forward slashes so the home folders also resolve on Linux.
+    # An explicit -SdkRoot wins, then the environment, then the user's home
+    # folders, then the Windows default. The provisioner also reads the
+    # environment and home folders, but not -SdkRoot or %LOCALAPPDATA%. The child
+    # names use forward slashes so the home folders also resolve on Linux.
     $roots = @($SdkRoot, $env:ANDROID_SDK_ROOT, $env:ANDROID_HOME)
     $homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } elseif ($env:HOME) { $env:HOME } else { $null }
     if ($homeDir) {
@@ -555,7 +556,7 @@ function Assert-RebuildToolchain {
         "  [x] apksig",
         "  [x] simpleperf",
         "",
-        "-Rebuild needs these on the build host (NDK 28.2.13676358):",
+        "-Rebuild needs these on the build host:",
         (Format-CheckLine ([bool]$makePath) "GNU Make" $makePath),
         (Format-CheckLine $jdkFound "JDK (javac, jar, keytool)" $jdkPath),
         (Format-CheckLine ([bool]$ndkPath) "Android NDK" $ndkPath),
@@ -865,7 +866,8 @@ function Assert-BuildOutputs {
     if ($missing.Count -gt 0) {
         $list = ($missing | ForEach-Object { "    $_" }) -join [Environment]::NewLine
         throw ("Missing prebuilt file(s) needed by this run:`n$list`n" +
-               "Run with -Rebuild so the provisioner builds them, or restore them from the release bundle.")
+               "Run the provisioner on a Linux build host (WSL counts) without --skip-build to build them, " +
+               "or restore them from the release bundle.")
     }
 }
 
@@ -920,16 +922,16 @@ function Invoke-Phase1 {
         return
     }
 
-    # The provisioner builds these itself unless it is passed --skip-build, so
-    # only require them up front for a --skip-build run.
-    if (-not $Rebuild) { Assert-BuildOutputs }
+    # This launcher always uses the prebuilt payloads; the provisioner is passed
+    # --skip-build below.
+    Assert-BuildOutputs
 
     $logDir = $script:LogDir
     Write-Notice "This runs the kernel exploit and reboots the Portal a few times. Keep USB connected."
 
     $pyArgs = @($provisioner, "--serial", $script:Serial, "--persistent-wireless-adb",
                 "--attempts", $Attempts, "--log-dir", $logDir)
-    if (-not $Rebuild) { $pyArgs += "--skip-build" }
+    $pyArgs += "--skip-build"
 
     $code = Invoke-Provisioner -PyArgs $pyArgs -LogDir $logDir
     if ($code -ne 0) {
@@ -1073,9 +1075,9 @@ function Invoke-Phase3 {
     $provisioner = Join-Path $ToolRoot "tools\provision_portal.py"
     if (-not (Test-Path $provisioner)) { throw "Provisioner not found: $provisioner" }
 
-    # Phase 3's action installs the same UID-1000 helper and boot hook the exploit
-    # carries, so a --skip-build run needs those prebuilt files too.
-    if (-not $Rebuild) { Assert-BuildOutputs }
+    # This launcher always uses the prebuilt payloads; the provisioner is passed
+    # --skip-build below.
+    Assert-BuildOutputs
 
     if (-not (Wait-PortalReady -TimeoutSeconds 120)) {
         Write-AdbRecoveryHint
@@ -1094,7 +1096,7 @@ function Invoke-Phase3 {
     $pyArgs = @($provisioner, "--serial", $script:Serial, "--permission-grants",
                 "--permission-grant-packages", $GrantPackages,
                 "--attempts", $Attempts, "--log-dir", $logDir)
-    if (-not $Rebuild) { $pyArgs += "--skip-build" }
+    $pyArgs += "--skip-build"
 
     $code = Invoke-Provisioner -PyArgs $pyArgs -LogDir $logDir
     if ($code -ne 0) {
@@ -1154,7 +1156,8 @@ function Invoke-Phase4 {
 # ---------------------------------------------------------------------------
 # Returns the cert (hex DER + sha256) that Android <Sdk> would use for <Apk>.
 # Uses tools\ExtractApkCert.class with apksig (found or fetched by
-# Bootstrap-Deps), or the .java source when the class is missing or older.
+# Bootstrap-Deps). The .java source is used only when the class is missing, and
+# that path needs a JDK; the bundled Java is a JRE.
 function Get-ApkSignerCert {
     param([string]$Apk, [int]$Sdk)
     $java = Get-JavaPath
@@ -1172,6 +1175,10 @@ function Get-ApkSignerCert {
     # The committed class is what the bundled JRE can run. If you change the
     # source, rebuild the class as described in AGENTS.md.
     $runSource = -not $hasClass -and $hasSource
+    if ($hasClass -and $hasSource -and
+        ((Get-Item -LiteralPath $src).LastWriteTimeUtc - (Get-Item -LiteralPath $class).LastWriteTimeUtc).TotalMinutes -gt 1) {
+        Write-Notice "ExtractApkCert.java is newer than ExtractApkCert.class; using the class. Rebuild it if you changed the source."
+    }
     # java writes to stderr for warnings or a missing signer; under
     # $ErrorActionPreference=Stop that would throw before we can read the output.
     $prev = $ErrorActionPreference
@@ -1260,10 +1267,9 @@ $script:MessengerCertHex = "30820268308201d102044a9c4610300d06092a864886f70d0101
 # signatures, then reboot.  Returns the presence (host) signing-cert object.
 function Set-PresenceMessengerTrust {
     param([Parameter(Mandatory)][string]$ClientCertHex)
-    # This run installs the UID-1000 helper and boot hook, so a --skip-build run
-    # needs those prebuilt files before any device work starts. A device that is
-    # already patched never gets here, so it is not blocked by the check.
-    if (-not $Rebuild) { Assert-BuildOutputs }
+    # This run uses the prebuilt exploit payloads before it starts the
+    # provisioner. A device that is already patched never gets here.
+    Assert-BuildOutputs
     $sdk = [int](Invoke-AdbQuiet shell getprop ro.build.version.sdk).Output
     $remote = (Invoke-AdbQuiet shell "ls /system/priv-app/aloha_presence_release/ | grep -i '\.apk'").Output.Trim()
     if (-not $remote) { throw "Could not locate the installed presence APK." }
@@ -1282,7 +1288,7 @@ function Set-PresenceMessengerTrust {
                 "--permission-grant-packages", "com.facebook.alohaservices.presence",
                 "--permission-grant-cert", "$($hostCert.Hex),$ClientCertHex",
                 "--attempts", $Attempts, "--log-dir", $logDir)
-    if (-not $Rebuild) { $pyArgs += "--skip-build" }
+    $pyArgs += "--skip-build"
     try {
         $code = Invoke-Provisioner -PyArgs $pyArgs -LogDir $logDir
     } finally {
@@ -1375,9 +1381,9 @@ if (-not (Confirm-RiskWarning)) {
 }
 
 # Phase catalogue, in order. Only the phases named in -Phases are run; the rest
-# print a single "[Skipped]" line. needsBuild marks the phases that run the
-# provisioner without --skip-build, so -Rebuild has something to compile. deps
-# names the host tools a phase needs beyond adb.
+# print a single "[Skipped]" line. needsBuild marks the phases that use the
+# build outputs, so -Rebuild only reports requirements for those. deps names the
+# host tools a phase needs beyond adb.
 $PhaseCatalogue = @(
     @{ n = 1; label = "Phase 1 - root exploit + TCP 5555 recovery channel";                     needsBuild = $true;  deps = @("python", "simpleperf");                    run = { Invoke-Phase1 } },
     @{ n = 2; label = "Phase 2 - install the real Google stack (no stub)";                      needsBuild = $false; deps = @();                                           run = { Invoke-Phase2 } },

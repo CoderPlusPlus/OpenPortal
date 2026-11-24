@@ -816,6 +816,7 @@ class ShizukuCliTest(unittest.TestCase):
             with (
                 mock.patch.object(provisioner, "connect"),
                 mock.patch.object(provisioner, "verify_target"),
+                mock.patch.object(provisioner, "adb_framework_boot_preflight"),
                 mock.patch.object(
                     provisioner,
                     "resolve_shizuku_apk",

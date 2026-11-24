@@ -9,6 +9,9 @@ deps/*
 
 # Android build artifacts
 *.apk
+*.apkm
+*.apks
+*.xapk
 *.dex
 *.idsig
 
