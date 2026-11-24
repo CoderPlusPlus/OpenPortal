@@ -1,0 +1,58 @@
+name: Build and Create Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g., v1.0.0)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as a pre-release'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "name=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Package OpenPortal archive
+        run: |
+          STAGE_DIR="OpenPortal-${{ steps.tag.outputs.name }}"
+          mkdir -p "$STAGE_DIR/stack"
+          
+          cp -r messenger-patch portal-root-kiosk-satellite-main tools "$STAGE_DIR/"
+          cp OpenPortal.cmd OpenPortal.ps1 Readme.md LICENSE THIRD-PARTY-NOTICES.md "$STAGE_DIR/"
+          
+          # Keep the empty stack folder visible for users adding Google APKs
+          touch "$STAGE_DIR/stack/.gitkeep"
+          
+          zip -r "OpenPortal-${{ steps.tag.outputs.name }}-win.zip" "$STAGE_DIR"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: OpenPortal ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          prerelease: ${{ github.event.inputs.prerelease || false }}
+          files: OpenPortal-${{ steps.tag.outputs.name }}-win.zip
